@@ -1,0 +1,417 @@
+diff --git a/doc/man-sections/vpn-network-options.rst b/doc/man-sections/vpn-network-options.rst
+index 5b2f8470..ef8ca97d 100644
+--- a/doc/man-sections/vpn-network-options.rst
++++ b/doc/man-sections/vpn-network-options.rst
+@@ -50,6 +50,15 @@ routing.
+   :code:`null` or an arbitrary name string (:code:`X` can be omitted for
+   a dynamic device.)
+ 
++  The traffic could also pass without TUN/TAP to and from openvpn over
++  a socketpair to external process when :code:`|/bin/programX` syntax is
++  used.
++  This is an alternative to using a tun/tap interface to pass traffic
++  to and from the OS kernel; unlike tun/tap it does not require any
++  special privileges. The path must start with a `|` (pipe) character.
++  This works with either :code:`tun` or :code:`tap`.
++  If left unspecified, it will default to tun.
++
+   See examples section below for an example on setting up a TUN device.
+ 
+   You must use either tun devices on both ends of the connection or tap
+diff --git a/src/openvpn/init.c b/src/openvpn/init.c
+index 1bfbf4eb..f2d47314 100644
+--- a/src/openvpn/init.c
++++ b/src/openvpn/init.c
+@@ -1607,7 +1607,9 @@ do_route(const struct options *options,
+          struct env_set *es,
+          openvpn_net_ctx_t *ctx)
+ {
+-    if (!options->route_noexec && ( route_list || route_ipv6_list ) )
++      if (!options->route_noexec &&
++          !tt->is_pipe &&
++          ( route_list || route_ipv6_list ) )
+     {
+         add_routes(route_list, route_ipv6_list, tt, ROUTE_OPTION_FLAGS(options),
+                    es, ctx);
+@@ -1724,12 +1726,12 @@ do_open_tun(struct context *c)
+ 
+     /* parse and resolve the route option list */
+     ASSERT(c->c2.link_socket);
+-    if (c->options.routes && c->c1.route_list)
++    if (c->options.routes && c->c1.route_list && !c->c1.tuntap->is_pipe)
+     {
+         do_init_route_list(&c->options, c->c1.route_list,
+                            &c->c2.link_socket->info, c->c2.es, &c->net_ctx);
+     }
+-    if (c->options.routes_ipv6 && c->c1.route_ipv6_list)
++    if (c->options.routes_ipv6 && c->c1.route_ipv6_list && !c->c1.tuntap->is_pipe)
+     {
+         do_init_route_ipv6_list(&c->options, c->c1.route_ipv6_list,
+                                 &c->c2.link_socket->info, c->c2.es,
+@@ -1737,7 +1739,9 @@ do_open_tun(struct context *c)
+     }
+ 
+     /* do ifconfig */
++    c->c1.tuntap->mtu = c->c2.frame.tun_mtu;
+     if (!c->options.ifconfig_noexec
++        && !c->c1.tuntap->is_pipe
+         && ifconfig_order() == IFCONFIG_BEFORE_TUN_OPEN)
+     {
+         /* guess actual tun/tap unit number that will be returned
+@@ -1746,12 +1750,12 @@ do_open_tun(struct context *c)
+                                              c->options.dev_type,
+                                              c->options.dev_node,
+                                              &gc);
+-        do_ifconfig(c->c1.tuntap, guess, c->c2.frame.tun_mtu, c->c2.es,
+-                    &c->net_ctx);
++        do_ifconfig(c->c1.tuntap, guess, c->c2.es, &c->net_ctx);
+     }
+ 
+     /* possibly add routes */
+-    if (route_order() == ROUTE_BEFORE_TUN)
++    if (route_order() == ROUTE_BEFORE_TUN
++        && !c->c1.tuntap->is_pipe)
+     {
+         /* Ignore route_delay, would cause ROUTE_BEFORE_TUN to be ignored */
+         do_route(&c->options, c->c1.route_list, c->c1.route_ipv6_list,
+@@ -1766,7 +1770,8 @@ do_open_tun(struct context *c)
+              c->c1.tuntap);
+ 
+     /* set the hardware address */
+-    if (c->options.lladdr)
++    if (c->options.lladdr
++        && !c->c1.tuntap->is_pipe)
+     {
+         set_lladdr(&c->net_ctx, c->c1.tuntap->actual_name, c->options.lladdr,
+                    c->c2.es);
+@@ -1774,10 +1779,11 @@ do_open_tun(struct context *c)
+ 
+     /* do ifconfig */
+     if (!c->options.ifconfig_noexec
++        && !c->c1.tuntap->is_pipe
+         && ifconfig_order() == IFCONFIG_AFTER_TUN_OPEN)
+     {
+         do_ifconfig(c->c1.tuntap, c->c1.tuntap->actual_name,
+-                    c->c2.frame.tun_mtu, c->c2.es, &c->net_ctx);
++                    c->c2.es, &c->net_ctx);
+     }
+ 
+     /* run the up script */
+diff --git a/src/openvpn/run_command.c b/src/openvpn/run_command.c
+index 8b44d177..95eae15c 100644
+--- a/src/openvpn/run_command.c
++++ b/src/openvpn/run_command.c
+@@ -150,6 +150,13 @@ openvpn_execve(const struct argv *a, const struct env_set *es, const unsigned in
+             pid = fork();
+             if (pid == (pid_t)0) /* child side */
+             {
++              if (flags & S_SETPGRP)
++                {
++                    if (setpgid (0, getpid ()) == -1)
++                    {
++                        msg (M_WARN | M_ERRNO, "openvpn_execve: setpgid failed");
++                    }
++                }
+                 execve(cmd, argv, envp);
+                 exit(OPENVPN_EXECVE_FAILURE);
+             }
+@@ -159,7 +166,11 @@ openvpn_execve(const struct argv *a, const struct env_set *es, const unsigned in
+             }
+             else /* parent side */
+             {
+-                if (waitpid(pid, &ret, 0) != pid)
++                if (flags & S_NOWAIT)
++                {
++                    ret = (int)pid;
++                }
++                else if (waitpid (pid, &ret, 0) != pid)
+                 {
+                     ret = OPENVPN_EXECVE_ERROR;
+                 }
+@@ -206,6 +217,11 @@ openvpn_execve_check(const struct argv *a, const struct env_set *es, const unsig
+             goto done;
+         }
+     }
++    else if (flags & S_NOWAIT)
++    {
++        ret = stat;
++        goto done;
++    }
+     else if (platform_system_ok(stat))
+     {
+         ret = true;
+diff --git a/src/openvpn/run_command.h b/src/openvpn/run_command.h
+index 966283ab..6f254eb1 100644
+--- a/src/openvpn/run_command.h
++++ b/src/openvpn/run_command.h
+@@ -47,6 +47,8 @@ void script_security_set(int level);
+ /** Instead of returning 1/0 for success/fail,
+  * return exit code when between 0 and 255 and -1 otherwise */
+ #define S_EXITCODE  (1<<2)
++#define S_NOWAIT    (1<<3)
++#define S_SETPGRP   (1<<4)
+ 
+ /* wrapper around the execve() call */
+ int openvpn_popen(const struct argv *a,  const struct env_set *es);
+diff --git a/src/openvpn/tun.c b/src/openvpn/tun.c
+index 4acccbff..1a0c24bc 100644
+--- a/src/openvpn/tun.c
++++ b/src/openvpn/tun.c
+@@ -372,6 +372,10 @@ dev_type_enum(const char *dev, const char *dev_type)
+     {
+         return DEV_TYPE_NULL;
+     }
++    else if (dev && *dev == '|')
++    {
++        return DEV_TYPE_TUN;
++    }
+     else
+     {
+         return DEV_TYPE_UNDEF;
+@@ -753,6 +757,11 @@ init_tun(const char *dev,        /* --dev option */
+     tt->type = dev_type_enum(dev, dev_type);
+     tt->topology = topology;
+ 
++    if (dev && *dev == '|')
++    {
++        tt->is_pipe = true;
++    }
++
+     if (ifconfig_local_parm && ifconfig_remote_netmask_parm)
+     {
+         bool tun = false;
+@@ -1572,9 +1581,10 @@ do_ifconfig_ipv4(struct tuntap *tt, const char *ifname, int tun_mtu,
+ 
+ /* execute the ifconfig command through the shell */
+ void
+-do_ifconfig(struct tuntap *tt, const char *ifname, int tun_mtu,
++do_ifconfig(struct tuntap *tt, const char *ifname,
+             const struct env_set *es, openvpn_net_ctx_t *ctx)
+ {
++    int tun_mtu = tt->mtu;
+     msg(D_LOW, "do_ifconfig, ipv4=%d, ipv6=%d", tt->did_ifconfig_setup,
+         tt->did_ifconfig_ipv6_setup);
+ 
+@@ -1625,6 +1635,69 @@ open_null(struct tuntap *tt)
+     tt->actual_name = string_alloc("null", NULL);
+ }
+ 
++static void
++set_vpnc_vars (struct env_set *es, struct tuntap *tt)
++{
++    struct gc_arena gc = gc_new();
++
++    setenv_str(es, "INTERNAL_IP4_ADDRESS", (char*)print_in_addr_t(tt->local, 0, &gc));
++    setenv_int(es, "INTERNAL_IP4_MTU", tt->mtu);
++
++    if (tt->did_ifconfig_ipv6_setup)
++    {
++        const char *ifconfig_ipv6_local = print_in6_addr(tt->local_ipv6, 0, &gc);
++        struct buffer out6 = alloc_buf_gc(64, &gc);
++
++        buf_printf(&out6, "%s/%d", ifconfig_ipv6_local, tt->netbits_ipv6);
++        setenv_str(es, "INTERNAL_IP6_NETMASK", (char*)buf_bptr(&out6));
++    }
++
++    gc_free (&gc);
++}
++
++static void
++open_pipe (const char *dev, struct tuntap *tt)
++{
++    struct argv argv;
++    struct env_set *es;
++    int fds[2], pid;
++
++    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) == -1)
++    {
++        msg(M_FATAL | M_ERRNO, "ERROR: socketpair call failed");
++    }
++
++    tt->fd = fds[0];
++    tt->actual_name = string_alloc("pipe", NULL);
++
++    set_nonblock(tt->fd);
++    set_cloexec(tt->fd);
++
++    es = env_set_create(NULL);
++    setenv_int(es, "VPNFD", fds[1]);
++    set_vpnc_vars(es, tt);
++
++    argv = argv_new();
++    /* dev looks like: "|/path/to/program <args...>" */
++    argv_printf(&argv, "/bin/sh -c %s", &dev[1]);
++    pid = openvpn_execve_check(&argv, es, M_ERR | S_SCRIPT | S_NOWAIT | S_SETPGRP,
++                               "ERROR: Unable to execute TUN script");
++    argv_free(&argv);
++    env_set_destroy(es);
++    close(fds[1]);
++
++    /*
++    * This doesn't detect errors in the subprocess, but hopefully we'll notice
++    * if the other side of the socketpair gets closed.
++    */
++    if (pid <= 0)
++    {
++        msg(M_FATAL, "ERROR: unable to start subprocess");
++    }
++    tt->pipe_pid = (pid_t)pid;
++}
++
++
+ 
+ #if defined (TARGET_OPENBSD) || (defined(TARGET_DARWIN) && HAVE_NET_IF_UTUN_H)
+ 
+@@ -1732,7 +1805,11 @@ open_tun_generic(const char *dev, const char *dev_type, const char *dev_node,
+     char dynamic_name[256];
+     bool dynamic_opened = false;
+ 
+-    if (tt->type == DEV_TYPE_NULL)
++    if (tt->is_pipe)
++    {
++        open_pipe (dev, tt);
++    }
++    else if (tt->type == DEV_TYPE_NULL)
+     {
+         open_null(tt);
+     }
+@@ -1841,6 +1918,10 @@ close_tun_generic(struct tuntap *tt)
+     }
+ 
+     free(tt->actual_name);
++    if (tt->pipe_pid)
++    {
++        kill (-tt->pipe_pid, SIGHUP);
++    }
+     clear_tuntap(tt);
+ }
+ #endif /* !_WIN32 */
+@@ -1948,11 +2029,15 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
+ {
+     struct ifreq ifr;
+ 
+-    /*
+-     * We handle --dev null specially, we do not open /dev/null for this.
+-     */
+-    if (tt->type == DEV_TYPE_NULL)
++    if (tt->is_pipe)
++    {
++        open_pipe (dev, tt);
++    }
++    else if (tt->type == DEV_TYPE_NULL)
+     {
++        /*
++        * We handle --dev null specially, we do not open /dev/null for this.
++        */
+         open_null(tt);
+     }
+     else
+@@ -2188,7 +2273,7 @@ close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+ {
+     ASSERT(tt);
+ 
+-    if (tt->type != DEV_TYPE_NULL)
++    if (tt->type != DEV_TYPE_NULL && !tt->is_pipe)
+     {
+         if (tt->did_ifconfig_setup)
+         {
+@@ -2244,7 +2329,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
+      */
+     CLEAR(ifr);
+ 
+-    if (tt->type == DEV_TYPE_NULL)
++    if (tt->is_pipe)
++    {
++        open_pipe (dev, tt);
++        return;
++    }
++    else if (tt->type == DEV_TYPE_NULL)
+     {
+         open_null(tt);
+         return;
+@@ -2526,6 +2616,11 @@ close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+ 
+     free(tt->actual_name);
+ 
++    if (tt->pipe_pid)
++    {
++        kill (-tt->pipe_pid, SIGHUP);
++    }
++
+     clear_tuntap(tt);
+     free(tt);
+ }
+@@ -3282,6 +3377,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
+     char dynamic_name[20];
+     const char *p;
+ 
++    if (tt->is_pipe)
++    {
++        open_pipe (dev, tt);
++        return;
++    }
++
+     if (tt->type == DEV_TYPE_NULL)
+     {
+         open_null(tt);
+@@ -6593,7 +6694,12 @@ open_tun(const char *dev, const char *dev_type, const char *dev_node, struct tun
+ 
+     msg( M_INFO, "open_tun");
+ 
+-    if (tt->type == DEV_TYPE_NULL)
++    if (tt->is_pipe)
++    {
++        open_pipe (dev, tt);
++        return;
++    }
++    else if (tt->type == DEV_TYPE_NULL)
+     {
+         open_null(tt);
+         return;
+@@ -6713,6 +6819,12 @@ close_tun(struct tuntap *tt, openvpn_net_ctx_t *ctx)
+ {
+     ASSERT(tt);
+ 
++    if (tt->pipe_pid)
++    {
++        kill (-tt->pipe_pid, SIGHUP);
++        return;
++    }
++
+     struct gc_arena gc = gc_new();
+ 
+     if (tt->did_ifconfig_ipv6_setup)
+diff --git a/src/openvpn/tun.h b/src/openvpn/tun.h
+index b7786f46..8c42fa06 100644
+--- a/src/openvpn/tun.h
++++ b/src/openvpn/tun.h
+@@ -162,6 +162,8 @@ struct tuntap
+ #define TUNNEL_TOPOLOGY(tt) ((tt) ? ((tt)->topology) : TOP_UNDEF)
+     int topology; /* one of the TOP_x values */
+ 
++    bool is_pipe;
++    pid_t pipe_pid;
+     bool did_ifconfig_setup;
+     bool did_ifconfig_ipv6_setup;
+ 
+@@ -174,6 +176,7 @@ struct tuntap
+     /* ifconfig parameters */
+     in_addr_t local;
+     in_addr_t remote_netmask;
++    int mtu;
+ 
+     struct in6_addr local_ipv6;
+     struct in6_addr remote_ipv6;
+@@ -293,11 +296,10 @@ void do_ifconfig_setenv(const struct tuntap *tt,
+  *
+  * @param tt        the tuntap interface context
+  * @param ifname    the human readable interface name
+- * @param mtu       the MTU value to set the interface to
+  * @param es        the environment to be used when executing the commands
+  * @param ctx       the networking API opaque context
+  */
+-void do_ifconfig(struct tuntap *tt, const char *ifname, int tun_mtu,
++void do_ifconfig(struct tuntap *tt, const char *ifname,
+                  const struct env_set *es, openvpn_net_ctx_t *ctx);
+ 
+ bool is_dev_type(const char *dev, const char *dev_type, const char *match_type);
