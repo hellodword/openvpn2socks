@@ -18,12 +18,12 @@
       in
       {
         packages.openvpn = pkgs.openvpn.overrideAttrs (_old: {
-          version = "2.6-rootless";
+          version = "2.6.19-rootless";
           src = pkgs.fetchFromGitHub {
             owner = "OpenVPN";
             repo = "openvpn";
-            rev = "dd98c38b31c02cbca7f88ed0a709e68f24361195";
-            hash = "sha256-B2nmRATq6QZ3rAKmv1kkBNOp9vJ7vhL5dxSyvgUev/A=";
+            rev = "5a7604d503425fba2df4bbf8c84bdcc53d33f2ac"; # v2.6.19
+            hash = "sha256-4QdCRnp3xRi08WZx7neoNBSLxVV3vpnhWKz3e8WNyNI=";
           };
           patches = [ ./openvpn-tunpipe.diff ];
           buildInputs =
